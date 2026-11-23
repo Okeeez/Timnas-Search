@@ -1,16 +1,39 @@
-import os, time, math, base64, html, hashlib, re
+import os, time, math, base64, html, hashlib, re, shutil
+from functools import lru_cache
 import numpy as np, pandas as pd
 import gradio as gr
 from collections import defaultdict, Counter
+
+# Konfigurasi cache HuggingFace diarahkan ke drive D: agar tidak memenuhi drive C:
+HF_CACHE_DIR = r"D:\hf_cache"
+os.environ["HF_HOME"] = HF_CACHE_DIR
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.makedirs(HF_CACHE_DIR, exist_ok=True)
+
+# Direktori tempat main.py berada agar emb_*.npy disimpan di folder yang sama (bukan C:)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 from preprocessing import preprocess, stem_token  # Import dari file terpisah
 
 # ===== KONFIGURASI =====
-EMBED_MODEL  = "paraphrase-multilingual-MiniLM-L12-v2"
-CHUNK_WORDS, CHUNK_STRIDE = 70, 60
-FILE_CORPUS = "Korpus_Bersih.xlsx"  # Gunakan korpus yang sudah dibersihkan
-FILE_QRELS  = "qrels.csv"
+EMBED_MODEL  = "intfloat/multilingual-e5-small"
+# Alternatif lain misalnya: "paraphrase-multilingual-MiniLM-L12-v2"
+RERANK_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+USE_RERANK   = False
+
+CHUNK_WORDS, CHUNK_STRIDE = 80, 50
+TITLE_WEIGHT = 0.5  # Bobot skor judul saat dikombinasikan dengan skor chunk terbaik
+SEM_MIN      = 0.72 # Batas mutlak minimum skor semantik (sesuaikan jika memakai model non-e5)
+SEM_REL      = 0.85 # Batas relatif terhadap skor semantik tertinggi (skor >= SEM_REL * max_sem)
+SEM_TOP_K    = 30   # Batas maksimum jumlah dokumen hasil semantik
+
+HYBRID_K     = 60   # Konstanta redaman Reciprocal Rank Fusion (RRF)
+HYBRID_W_LEX = 1.0  # Bobot kontribusi peringkat leksikal (BM25) pada Hybrid RRF
+HYBRID_W_SEM = 1.0  # Bobot kontribusi peringkat semantik pada Hybrid RRF
+
+FILE_CORPUS = os.path.join(BASE_DIR, "Korpus_Bersih.xlsx")  # Gunakan korpus yang sudah dibersihkan
+FILE_QRELS  = os.path.join(BASE_DIR, "qrels.csv")
 DOSEN       = "Dr. Nurul Chamidah, S.Kom., M.Kom."
-# Silakan isi NIM anggota tim di sini
 TIM = [("Fahmi Idrus", "2310511079"), ("Rezaul Karim", "2310511134"), ("Rayhan Andika Putra", "2310511122")]
 PER_PAGE    = 10
 
@@ -62,11 +85,27 @@ class Index:
 
 df["tokens"] = (df["title"] + " " + df["text"]).apply(preprocess)
 INDEX = Index(df["tokens"].tolist())
-print(f"Index siap: {INDEX.N} dokumen, {len(INDEX.post)} term unik.")
+if INDEX.N != len(df):
+    print(f"⚠️ PERINGATAN: Jumlah dokumen tidak konsisten! df={len(df)} dokumen, INDEX.N={INDEX.N} dokumen.")
+print(f"Index siap: {len(df)} dokumen termuat (df), {INDEX.N} dokumen terindeks (INDEX.N), {len(INDEX.post)} term unik.")
 
-# Semantic Index
+# Helper prefix untuk model keluarga E5
+def _is_e5(model_name: str) -> bool:
+    return "e5" in str(model_name).lower()
+
+def _prep_query_text(query: str) -> str:
+    q = str(query).strip()
+    return f"query: {q}" if _is_e5(EMBED_MODEL) else q
+
+def _prep_passage_text(text: str) -> str:
+    p = str(text).strip()
+    return f"passage: {p}" if _is_e5(EMBED_MODEL) else p
+
+# Semantic Index (Chunk Embedding + Title Embedding)
 CHUNKS = []
+TITLES_RAW = []
 for i, r in df.iterrows():
+    TITLES_RAW.append(r["title"])
     w = r["text"].split() or [r["title"]]
     for st in range(0, len(w), CHUNK_STRIDE):
         seg = " ".join(w[st:st + CHUNK_WORDS])
@@ -75,49 +114,113 @@ for i, r in df.iterrows():
 CH_DOC   = np.array([c[0] for c in CHUNKS])
 CH_START = np.r_[0, np.flatnonzero(np.diff(CH_DOC)) + 1]
 
+# Jika unduhan gagal karena cache parsial korup di C:, hapus folder:
+# C:\Users\rayha\.cache\huggingface\hub\models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2
 try:
     from sentence_transformers import SentenceTransformer
-    SEM_MODEL = SentenceTransformer(EMBED_MODEL)
-    key = hashlib.md5((EMBED_MODEL + "|".join(c[2] for c in CHUNKS)).encode()).hexdigest()[:10]
-    emb_file = f"emb_{key}.npy"
-    
+    SEM_MODEL = SentenceTransformer(EMBED_MODEL, cache_folder=HF_CACHE_DIR)
+    chunk_payload = "|".join(c[2] for c in CHUNKS)
+    title_payload = "|".join(TITLES_RAW)
+    chunk_key = hashlib.md5(f"{EMBED_MODEL}|chunks|{CHUNK_WORDS}|{CHUNK_STRIDE}|{chunk_payload}".encode()).hexdigest()[:10]
+    title_key = hashlib.md5(f"{EMBED_MODEL}|titles|{title_payload}".encode()).hexdigest()[:10]
+    emb_file = os.path.join(BASE_DIR, f"emb_{chunk_key}.npy")
+    title_emb_file = os.path.join(BASE_DIR, f"emb_title_{title_key}.npy")
+
+    need_encode_chunks = not os.path.exists(emb_file)
+    need_encode_titles = not os.path.exists(title_emb_file)
+    if need_encode_chunks or need_encode_titles:
+        print(f"Mengunduh & memproses embedding semantic ({EMBED_MODEL})...")
+
     if os.path.exists(emb_file):
         CH_EMB = np.load(emb_file)
     else:
-        print("Mengunduh & memproses embedding semantic (sekitar 470MB)...")
-        CH_EMB = SEM_MODEL.encode([c[2] for c in CHUNKS], batch_size=32, normalize_embeddings=True, show_progress_bar=True)
+        passage_chunks = [_prep_passage_text(c[2]) for c in CHUNKS]
+        CH_EMB = SEM_MODEL.encode(passage_chunks, batch_size=32, normalize_embeddings=True, show_progress_bar=True)
         np.save(emb_file, CH_EMB)
+
+    if os.path.exists(title_emb_file):
+        TITLE_EMB = np.load(title_emb_file)
+    else:
+        passage_titles = [_prep_passage_text(t) for t in TITLES_RAW]
+        TITLE_EMB = SEM_MODEL.encode(passage_titles, batch_size=32, normalize_embeddings=True, show_progress_bar=False)
+        np.save(title_emb_file, TITLE_EMB)
+
     SEM_OK = True
-    print(f"Semantic index siap: {len(CHUNKS)} potongan.")
+    print(f"Semantic index siap: {len(CHUNKS)} potongan, {len(TITLES_RAW)} judul.")
 except Exception as e:
-    SEM_OK, SEM_MODEL, CH_EMB = False, None, None
-    print("⚠️ Semantic search tidak aktif:", e)
+    SEM_OK, SEM_MODEL, CH_EMB, TITLE_EMB = False, None, None, None
+    try:
+        free_mb = shutil.disk_usage(HF_CACHE_DIR).free / (1024 * 1024)
+        disk_info = f"Sisa ruang disk di '{HF_CACHE_DIR}': {free_mb:.2f} MB."
+    except Exception:
+        disk_info = f"Tidak dapat memeriksa sisa ruang disk di '{HF_CACHE_DIR}'."
+    print(
+        f"⚠️ Semantic search tidak aktif: {e}\n"
+        f"   {disk_info} Pastikan ruang kosong memadai (minimal ~600 MB untuk model & cache) "
+        f"atau ubah HF_CACHE_DIR / HF_HOME ke drive lain yang memiliki ruang cukup. Aplikasi tetap berjalan dengan BM25."
+    )
+
+RERANKER = None
+if SEM_OK and USE_RERANK:
+    try:
+        from sentence_transformers import CrossEncoder
+        RERANKER = CrossEncoder(RERANK_MODEL, cache_folder=HF_CACHE_DIR)
+        print(f"Cross-encoder reranker siap: {RERANK_MODEL}")
+    except Exception as e:
+        RERANKER = None
+        print(f"⚠️ Reranker tidak dimuat (dilewati): {e}")
+
+@lru_cache(maxsize=512)
+def _encode_query_cached(query_text: str, model_name: str):
+    q_formatted = _prep_query_text(query_text)
+    vec = SEM_MODEL.encode([q_formatted], batch_size=1, normalize_embeddings=True, show_progress_bar=False)[0]
+    return vec.tobytes(), vec.shape, str(vec.dtype)
+
+def encode_query(query: str) -> np.ndarray:
+    raw, shape, dtype = _encode_query_cached(str(query), EMBED_MODEL)
+    return np.frombuffer(raw, dtype=np.dtype(dtype)).reshape(shape)
 
 def semantic_scores(query):
-    q = SEM_MODEL.encode([query], normalize_embeddings=True)[0]
+    q = encode_query(query)
     sims = CH_EMB @ q
-    return np.maximum.reduceat(sims, CH_START), sims
+    chunk_best = np.maximum.reduceat(sims, CH_START)
+    title_sims = TITLE_EMB @ q
+    combined = np.maximum(chunk_best, TITLE_WEIGHT * title_sims + (1.0 - TITLE_WEIGHT) * chunk_best)
+    return combined, sims
+
+def filter_semantic_candidates(sem_scores: np.ndarray, mask: np.ndarray):
+    """Kembalikan array indeks dokumen yang lolos threshold adaptif (SEM_MIN & SEM_REL) dan SEM_TOP_K."""
+    valid = np.where(mask & (sem_scores >= SEM_MIN))[0]
+    if len(valid) == 0:
+        return np.array([], dtype=int)
+    max_sc = float(np.max(sem_scores[valid]))
+    rel_cut = SEM_REL * max_sc
+    keep = valid[sem_scores[valid] >= rel_cut]
+    keep = keep[np.argsort(-sem_scores[keep], kind="stable")]
+    if SEM_TOP_K:
+        keep = keep[:SEM_TOP_K]
+    return keep
 
 def best_chunk(i, sims):
     s = CH_START[i]; e = CH_START[i + 1] if i + 1 < len(CH_START) else len(sims)
     return CHUNKS[s + int(np.argmax(sims[s:e]))][1]
 
-# Perbaikan Query Expansion (hanya memuat bobot makna yang relevan)
-EXPANSION = {
-    "timnas": ["garuda", "skuad"],
-    "sty": ["shin tae-yong"],
-    "erick": ["thohir", "ketum", "pssi"],
-    "pelatih": ["coach"],
-    "suporter": ["penonton", "fans"],
-    "naturalisasi": ["diaspora"],
-    "kualifikasi": ["putaran", "babak"]
-}
-
-def expand_query(q):
-    ql = q.lower(); extra = []
-    for k, v in EXPANSION.items():
-        if re.search(rf"\b{re.escape(k)}\b", ql): extra += v
-    return q + " " + " ".join(extra)
+def rerank_hits(query: str, hits: list, top_rerank: int = 20) -> list:
+    if not RERANKER or len(hits) <= 1:
+        return hits
+    head = hits[:top_rerank]
+    tail = hits[top_rerank:]
+    pairs = []
+    for doc_idx, _, ch in head:
+        row = df.iloc[doc_idx]
+        passage = ch if ch else f"{row['title']}. {row['text'][:300]}"
+        pairs.append((query, passage))
+    rr_scores = RERANKER.predict(pairs, batch_size=16, show_progress_bar=False)
+    rescored = sorted(
+        [(doc_idx, float(rr), ch) for (doc_idx, _, ch), rr in zip(head, rr_scores)],
+        key=lambda x: -x[1]
+    )
+    return rescored + tail
 
 def filter_mask(topik="Semua", waktu="Semua", media="Semua"):
     m = np.ones(len(df), bool)
@@ -130,67 +233,82 @@ def filter_mask(topik="Semua", waktu="Semua", media="Semua"):
             m &= (df["date"] >= df["date"].max() - pd.Timedelta(days=days)).values
     return m
 
-def search(query, model="BM25", expand=False, topik="Semua", waktu="Semua", media="Semua", top_n=None, k1=1.5, b=0.75, sem_min=0.30):
+def search(query, model="BM25", topik="Semua", waktu="Semua", media="Semua", top_n=None, k1=1.5, b=0.75):
     t0 = time.perf_counter()
     if model in ("Semantic", "Hybrid") and not SEM_OK: model = "BM25"
-    terms = preprocess(expand_query(query) if expand else query)
+    terms = preprocess(query)
     mask, n = filter_mask(topik, waktu, media), len(df)
     lex, sem, sims = np.zeros(n), np.zeros(n), None
     
     if model != "Semantic" and terms: lex = INDEX.tfidf(terms) if model == "TF-IDF" else INDEX.bm25(terms, k1, b)
     if model in ("Semantic", "Hybrid"): sem, sims = semantic_scores(query)
     
-    if model == "Semantic": sc = np.where(sem >= sem_min, sem, 0.0)
-    elif model == "Hybrid":
+    if model == "Semantic":
+        sem_keep = filter_semantic_candidates(sem, mask)
         sc = np.zeros(n)
-        for s_, ok in ((lex, lex > 0), (sem, sem >= sem_min)):
-            ix = np.where(ok & mask)[0]; ix = ix[np.argsort(-s_[ix], kind="stable")]
-            sc[ix] += 1.0 / (60 + np.arange(1, len(ix) + 1))
-    else: sc = lex
-    
-    idx = np.where((sc > 0) & mask)[0]; idx = idx[np.argsort(-sc[idx], kind="stable")]
+        sc[sem_keep] = sem[sem_keep]
+        idx = sem_keep
+    elif model == "Hybrid":
+        sem_keep = filter_semantic_candidates(sem, mask)
+        lex_keep = np.where(mask & (lex > 0))[0]
+        lex_keep = lex_keep[np.argsort(-lex[lex_keep], kind="stable")]
+        sc = np.zeros(n)
+        if len(lex_keep) > 0:
+            sc[lex_keep] += HYBRID_W_LEX * (1.0 / (HYBRID_K + np.arange(1, len(lex_keep) + 1)))
+        if len(sem_keep) > 0:
+            sc[sem_keep] += HYBRID_W_SEM * (1.0 / (HYBRID_K + np.arange(1, len(sem_keep) + 1)))
+        idx = np.where((sc > 0) & mask)[0]
+        idx = idx[np.argsort(-sc[idx], kind="stable")]
+    else:
+        sc = lex
+        idx = np.where((sc > 0) & mask)[0]
+        idx = idx[np.argsort(-sc[idx], kind="stable")]
+
     if top_n: idx = idx[:top_n]
     hits = [(int(i), float(sc[i]), best_chunk(int(i), sims) if sims is not None else None) for i in idx]
+    if model == "Hybrid" and RERANKER and hits:
+        hits = rerank_hits(query, hits, top_rerank=20)
+        if top_n: hits = hits[:top_n]
     return hits, terms, time.perf_counter() - t0
 
-# Query Pengujian Seimbang (Fakta, Parafrase, Semantic, Expansion)
-SYSTEMS = {"TF-IDF (baseline)": dict(model="TF-IDF", expand=False),
-           "BM25": dict(model="BM25", expand=False),
-           "BM25 + Query Expansion": dict(model="BM25", expand=True)}
+# Query Pengujian Seimbang (Fakta, Parafrase, Semantic, Semantic/sinonim)
+SYSTEMS = {"TF-IDF (baseline)": dict(model="TF-IDF"),
+           "BM25": dict(model="BM25")}
 if SEM_OK: SYSTEMS.update({"Semantic": dict(model="Semantic"), "Hybrid (BM25 + Semantic)": dict(model="Hybrid")})
 
 TEST_QUERIES = [
     "Jadwal Timnas U20 di kualifikasi piala asia",             # Fact / u20 regex test
-    "Pemain diaspora yang baru dinaturalisasi",                # Expansion test
+    "Pemain diaspora yang baru dinaturalisasi",                # Semantic/sinonim test
     "Strategi pelatih Shin Tae-yong melawan Jepang",           # Entity
     "Hasil pertandingan basket 3x3 putri SEA Games",           # KATA_PENTING test (3x3, sea)
     "Upaya peningkatan kompetensi pelatih angkat besi",        # Semantic paraphrase
-    "Dukungan suporter di stadion GBK",                        # Expansion
+    "Dukungan suporter di stadion GBK",                        # Semantic/sinonim
     "Kualitas tim sepak bola putri Garuda Pertiwi",            # Fact
     "Persiapan atlet disabilitas menuju Paralimpiade",         # Semantic
-    "Tanggapan Ketum PSSI mengenai prestasi E-Sports",         # Expansion & Protected words
+    "Tanggapan Ketum PSSI mengenai prestasi E-Sports",         # Semantic/sinonim & Protected words
     "Daftar pemain yang dicoret dari skuad"                    # Paraphrase (pemecatan/dicoret)
 ]
 
 def buat_template_qrels():
     rows = []
     for qi, q in enumerate(TEST_QUERIES, 1):
-        pool = {}
+        pool = []
+        seen = set()
         for cfg in SYSTEMS.values():
-            for i, *_ in search(q, top_n=10, **cfg)[0]: pool[i] = 1
-        rows += [dict(query_id=f"Q{qi}", query=q, doc_id=df.doc_id[i], title=df.title[i], relevan="")]
+            for i, *_ in search(q, top_n=10, **cfg)[0]:
+                if i not in seen:
+                    seen.add(i)
+                    pool.append(i)
+        for i in pool:
+            rows.append(dict(query_id=f"Q{qi}", query=q, doc_id=df.doc_id[i], title=df.title[i], relevan=""))
     pd.DataFrame(rows).to_csv("qrels_template.csv", index=False)
     print("qrels_template.csv berhasil dibuat. Isi kolom 'relevan' dengan 1 atau 0, lalu simpan sebagai qrels.csv.")
-
-# UI Gradio (Kode UI statis tidak diubah, dilewati untuk efisiensi panduan, 
-# Anda bisa menyalin blok UI (Gradio CSS & Blocks) dari notebook awal tanpa perubahan 
-# kecuali fungsi background dan text layout jika diperlukan).
 
 if __name__ == "__main__":
     if not os.path.exists("qrels_template.csv"): buat_template_qrels()
     
     # ------------------ BLOK UI GRADIO ------------------
-    BG_IMAGE = "suporter.jpg"
+    BG_IMAGE = os.path.join(BASE_DIR, "suporter.jpg")
 
     def bg_rule():
         if os.path.exists(BG_IMAGE):
@@ -252,13 +370,13 @@ if __name__ == "__main__":
 
     def make_snippet(text, terms, chunk):
         if not text: return ""
-        text = text[:350] + "..." if len(text) > 350 else text
         if chunk:
-            c_idx = text.lower().find(chunk.lower()[:30])
-            if c_idx != -1: text = ("..." if c_idx > 50 else "") + text[max(0, c_idx-50):c_idx+250] + "..."
-        if not terms: return html.escape(text)
+            src_text = chunk
+        else:
+            src_text = text[:350] + "..." if len(text) > 350 else text
+        if not terms: return html.escape(src_text)
         
-        esc = html.escape(text)
+        esc = html.escape(src_text)
         for t in sorted(terms, key=len, reverse=True):
             if len(t) < 3: continue
             ptn = re.compile(f"({re.escape(html.escape(t))})", re.IGNORECASE)
@@ -299,22 +417,18 @@ if __name__ == "__main__":
             
         return out, gr.update(interactive=page>1, visible=True), gr.update(interactive=page<pages, visible=True), gr.update(value=f"Halaman {page}/{pages}", visible=True)
 
-    def do_search(q, mod_label, exp_checkbox, top, wak, med):
+    def do_search(q, mod_label, top, wak, med):
         # Jika query kosong, batalkan pencarian
         if not q.strip(): 
             return "<div>Masukkan kata kunci.</div>", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), []
         
         # 1. BONGKAR DICTIONARY SYSTEMS
         # Ambil konfigurasi asli berdasarkan label yang dipilih di dropdown UI
-        config = SYSTEMS.get(mod_label, {"model": "BM25", "expand": False})
+        config = SYSTEMS.get(mod_label, {"model": "BM25"})
         actual_model = config["model"]
         
-        # 2. GABUNGKAN LOGIKA EKSPANSI
-        # Aktifkan ekspansi jika dropdown meminta ekspansi ATAU checkbox dicentang
-        use_expansion = config["expand"] or exp_checkbox
-        
-        # 3. PANGGIL FUNGSI SEARCH DENGAN PARAMETER YANG BENAR
-        h, t, dt = search(q, model=actual_model, expand=use_expansion, topik=top, waktu=wak, media=med)
+        # 2. PANGGIL FUNGSI SEARCH DENGAN PARAMETER YANG BENAR
+        h, t, dt = search(q, model=actual_model, topik=top, waktu=wak, media=med)
         
         # Tampilkan hasil
         out, p, n, l = hasil_html(h, t, dt, q, 1)
@@ -326,7 +440,9 @@ if __name__ == "__main__":
         out, p, n, l = hasil_html(state["hits"], state["terms"], state["dt"], state["q"], state["page"])
         return out, p, n, l, state
 
-    with gr.Blocks(title="Timnas Search", theme=gr.themes.Base()) as demo:
+    default_model_val = "Hybrid (BM25 + Semantic)" if SEM_OK else "BM25"
+
+    with gr.Blocks(title="Timnas Search") as demo:
         state = gr.State({})
         
         # Header (Logo & Search Bar sejajar ala Mockup 2)
@@ -340,8 +456,7 @@ if __name__ == "__main__":
             top_in = gr.Dropdown(["Semua"] + sorted([str(x) for x in df['topic'].unique() if str(x).strip()]), value="Semua", label="Topik", container=False, elem_classes="pill-dropdown")
             wak_in = gr.Dropdown(["Semua", "7 hari terakhir", "30 hari terakhir", "1 tahun terakhir"], value="Semua", label="Waktu", container=False, elem_classes="pill-dropdown")
             med_in = gr.Dropdown(["Semua"] + sorted([str(x) for x in df['media'].unique() if str(x).strip()]), value="Semua", label="Media", container=False, elem_classes="pill-dropdown")
-            mod_in = gr.Dropdown(list(SYSTEMS.keys()), value="BM25", label="Model (Korpus N)", container=False, elem_classes="pill-dropdown")
-            exp_in = gr.Checkbox(label="Expansion", value=False, elem_classes="pill-dropdown")
+            mod_in = gr.Dropdown(list(SYSTEMS.keys()), value=default_model_val, label="Model (Korpus N)", container=False, elem_classes="pill-dropdown")
             btn = gr.Button("Search 🔍", variant="primary", elem_classes="pill-dropdown")
 
         # Tabs Layout
@@ -371,10 +486,10 @@ if __name__ == "__main__":
         """)
 
         # Event Listeners
-        btn.click(do_search, [q_in, mod_in, exp_in, top_in, wak_in, med_in], [out_html, prev_b, next_b, page_l, state])
-        q_in.submit(do_search, [q_in, mod_in, exp_in, top_in, wak_in, med_in], [out_html, prev_b, next_b, page_l, state])
+        btn.click(do_search, [q_in, mod_in, top_in, wak_in, med_in], [out_html, prev_b, next_b, page_l, state])
+        q_in.submit(do_search, [q_in, mod_in, top_in, wak_in, med_in], [out_html, prev_b, next_b, page_l, state])
         prev_b.click(lambda s: change_page(s, -1), state, [out_html, prev_b, next_b, page_l, state])
         next_b.click(lambda s: change_page(s, 1), state, [out_html, prev_b, next_b, page_l, state])
 
-    # Eksekusi dengan inject CSS dan background image script
-    demo.launch(css=bg_rule() + CSS_STATIC)
+    # Eksekusi dengan inject CSS, theme, dan background image script
+    demo.launch(theme=gr.themes.Base(), css=bg_rule() + CSS_STATIC)
