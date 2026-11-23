@@ -1,1 +1,31 @@
-  run: python main.py
+name: Jalankan Timnas Search
+
+on:
+  # 1. Tombol manual di tab Actions GitHub
+  workflow_dispatch:
+  # 2. Otomatis jalan setiap kali kamu git push dari VS Code ke branch main
+  push:
+    branches: [main]
+
+jobs:
+  run-gradio-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # Maksimal aktif 6 jam per run
+
+    steps:
+      - name: Ambil kode dari repository
+        uses: actions/checkout@v4
+
+      - name: Siapkan Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install library dari requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Jalankan python main.py
+        run: python -u main.py
