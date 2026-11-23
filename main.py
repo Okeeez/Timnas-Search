@@ -29,3 +29,9 @@ if __name__ == "__main__":
     if not os.path.exists(FILE_QRELS_TEMPLATE):
         buat_template_qrels()
     ui.launch()
+
+demo.launch(
+    theme=gr.themes.Base(),
+    css=bg_rule() + CSS_STATIC,
+    share=True,  # <-- Wajib ditambahkan agar mendapat link publik dari GitHub
+)
