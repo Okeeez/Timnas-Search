@@ -33,5 +33,7 @@ if __name__ == "__main__":
 demo.launch(
     theme=gr.themes.Base(),
     css=bg_rule() + CSS_STATIC,
-    share=True,  # <-- Wajib ditambahkan agar mendapat link publik dari GitHub
+    server_name="0.0.0.0",
+    server_port=int(os.environ.get("PORT", 7860)),
+    share=True,  # <-- Wajib agar muncul link publik saat di-run di GitHub
 )
