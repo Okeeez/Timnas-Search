@@ -1,0 +1,6 @@
+pandas
+openpyxl
+PySastrawi
+sentence-transformers
+gradio>=4.44,<6
+numpy
